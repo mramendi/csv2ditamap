@@ -10,6 +10,8 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Optional
+import os.path
+import sys
 
 # Configure logging
 logging.basicConfig(
@@ -18,34 +20,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-class CSVEntry:
-    """Represents a single entry from the CSV with its hierarchical level and text."""
-
-    def __init__(self, level: int, text: str, line_number: int):
-        self.level = level
-        self.text = text
-        self.line_number = line_number
-
-    def __repr__(self):
-        return f"CSVEntry(level={self.level}, text='{self.text}', line={self.line_number})"
-
-
-def title_to_filename(title: str) -> str:
+def title_to_basename(title: str) -> str:
     """
-    Convert a title to a valid DITA filename.
+    Convert a title to a valid basename for a file.
 
     Args:
         title: The title text to convert
 
     Returns:
-        A valid filename ending with .dita
+        A valid file basename
 
     Examples:
-        "3.5.1.1. Managing cluster components" -> "managing_cluster_components.dita"
-        "Introduction to OpenShift" -> "introduction_to_openshift.dita"
-        "Chapter 1. Getting Started" -> "getting_started.dita"
-        "CHAPTER 3.5.2 Installation" -> "installation.dita"
+        "3.5.1.1. Managing cluster components" -> "managing_cluster_components"
+        "Introduction to OpenShift" -> "introduction_to_openshift"
+        "Chapter 1. Getting Started" -> "getting_started"
+        "CHAPTER 3.5.2 Installation" -> "installation"
     """
     # Remove "chapter" (case-insensitive) at the start
     text = re.sub(r'^chapter\s*', '', title, flags=re.IGNORECASE)
@@ -65,9 +54,39 @@ def title_to_filename(title: str) -> str:
     # Replace multiple spaces with single underscore
     text = re.sub(r'\s+', '_', text)
 
-    # Add .dita extension
-    return f"{text}.dita"
+    return text
 
+
+
+class Column:
+    """Represents a non-empty column."""
+    def __init__(self, idx: int, text: str):
+        self.idx = idx
+        self.text = text
+
+    def __repr__(self):
+        return f"Column {self.idx}: {self.text}"
+
+
+class CSVEntry:
+    """Represents a single entry from the CSV with its hierarchical level and text.
+        Exception: categories get their own entries though can be on the same line"""
+
+    def __init__(self, level: int, line_number: int, filename:str = None, is_job:bool = False, navtitle:str = ''):
+        self.level = level
+        self.line_number = line_number
+        self.filename=filename
+        self.is_job=is_job
+        self.navtitle = navtitle
+
+    def __repr__(self):
+        return f"CSVEntry(level={self.level}, line={self.line_number}, filename={self.filename}, is_job={self.is_job}, navtitle={self.navtitle})"
+
+# helper to read a column of a row safely
+def get_column(row, index):
+    if len(row) > index:
+        return row[index].strip()
+    return ''
 
 def parse_csv(filepath: str) -> List[CSVEntry]:
     """
@@ -84,41 +103,71 @@ def parse_csv(filepath: str) -> List[CSVEntry]:
     with open(filepath, 'r', encoding='utf-8') as csvfile:
         reader = csv.reader(csvfile)
 
-        # Skip the header row
-        next(reader, None)
+        # Skip lines until we find the header line (first column says "Category")
+        line_number = 0
+        for row in reader:
+            line_number += 1
+            if row and row[0].strip().lower() == 'category':
+                # Found the header line, skip it and start processing after
+                break
 
-        for line_number, row in enumerate(reader, start=2):  # Start at 2 since we skipped header
+        # Now process the rest of the rows
+        for row in reader:
+            shift_idx = 0
+            line_number += 1
+
             # Find all non-empty columns
-            non_empty_columns = [(idx, col.strip()) for idx, col in enumerate(row) if col.strip()]
+            non_empty_columns = [Column(idx, col.strip()) for idx, col in enumerate(row) if col.strip()]
+            # TEMP
+            #print(line_number, non_empty_columns)
 
-            # Skip lines with no non-empty columns
+            # if the first column is non-empty, create a category entry and delete from the list
+            # A category never has a topic file name
+            if (len(non_empty_columns) > 0) and (non_empty_columns[0].idx == 0):
+                category_entry = CSVEntry(level=0, line_number=line_number, is_job=True, 
+                                          filename=None, navtitle=non_empty_columns[0].text)
+ 
+                entries.append(category_entry)
+                del non_empty_columns[0]
+#                shift_idx = 1
+
+
+            # Skip lines with no non-empty columns (or just the "job" marker)
             if len(non_empty_columns) == 0:
                 continue
+            if (len (non_empty_columns) == 1) and (non_empty_columns[0].text.upper() in ["TRUE","FALSE"]):
+                continue 
 
-            # Special case: if exactly columns 0 and 1 are filled, expand into two entries
-            if (len(non_empty_columns) == 2 and
-                non_empty_columns[0][0] == 0 and
-                non_empty_columns[1][0] == 1):
-                # Create two entries: level 0 first, then level 1
-                entry0 = CSVEntry(level=0, text=non_empty_columns[0][1], line_number=line_number)
-                entry1 = CSVEntry(level=1, text=non_empty_columns[1][1], line_number=line_number)
-                entries.append(entry0)
-                entries.append(entry1)
+            entry_idx = non_empty_columns[0].idx
+            # the text in non_empty_columns[0] gets discarded as the navtitle is a separate column
+            entry_filename = None
+            entry_is_job = False
+            entry_navtitle = ""
+
+            try:
+                entry_filename = non_empty_columns[1].text.strip()
+                if (entry_filename.lower().find(".dita") == -1) and (entry_filename.lower().find(".adoc") == -1):
+                    logger.warning(f"Line {line_number}: filename does not seem to have the right extension? {entry_filename}")
+                entry_filename, _ = os.path.splitext(entry_filename)
+                
+
+                entry_is_job = (non_empty_columns[2].text.strip().upper() == "TRUE")
+                if not (non_empty_columns[2].text.strip().upper() in ["TRUE","FALSE"]):
+                    logger.warning(f"Line {line_number}: is_job not TRUE nor FALSE? {non_empty_columns[2].text}")
+
+                entry_navtitle = non_empty_columns[3].text
+            except IndexError:
+                logger.warning(f"Line {line_number} does not seem to have all fields")
                 continue
 
-            # Warn if more than one non-empty column (other cases)
-            if len(non_empty_columns) > 1:
-                logger.warning(
-                    f"Line {line_number}: Multiple non-empty columns found. "
-                    f"Using first one. Columns: {non_empty_columns}"
-                )
-
-            # Get the first non-empty column
-            level, text = non_empty_columns[0]
-
-            # Create entry with level (number of empty columns before the non-empty one)
-            entry = CSVEntry(level=level, text=text, line_number=line_number)
+            # temp
+            #print(entry_filename)
+            entry = CSVEntry(level=shift_idx+entry_idx, line_number=line_number, is_job=entry_is_job, filename=entry_filename, navtitle=entry_navtitle)
             entries.append(entry)
+
+
+    # TEMP
+    for entry in entries: print(entry)
 
     return entries
 
@@ -144,7 +193,8 @@ def create_ditamap(map_id: str, map_title: str) -> ET.Element:
     return map_root
 
 
-def add_topicref(parent: ET.Element, href: str, topic_type: Optional[str] = None) -> ET.Element:
+def add_topicref(parent: ET.Element, href: str, topic_type: Optional[str] = None,
+                 navtitle: str = '') -> ET.Element:
     """
     Add a topicref element to a parent element.
 
@@ -156,11 +206,31 @@ def add_topicref(parent: ET.Element, href: str, topic_type: Optional[str] = None
     Returns:
         The created topicref element (allows for nesting by adding children to it)
     """
+    if href is None: 
+        href = "placeholder.dita"
     attribs = {'href': href}
     if topic_type:
         attribs['type'] = topic_type
+    if navtitle:
+        attribs['navtitle'] = topic_type
 
     topicref = ET.SubElement(parent, 'topicref', attrib=attribs)
+    return topicref
+
+def add_mapref(parent: ET.Element, href: str) -> ET.Element:
+    """
+    Add a mapref element to a parent element.
+
+    Args:
+        parent: The parent element to add the mapref to (typically <map> or a <topicref>)
+        href: The href attribute (filename to reference)
+
+    Returns:
+        The created topicref element (allows for nesting by adding children to it)
+    """
+    attribs = {'href': href}
+
+    topicref = ET.SubElement(parent, 'mapref', attrib=attribs)
     return topicref
 
 
@@ -192,20 +262,47 @@ def write_ditamap(map_root: ET.Element, output_file: str):
 
     logger.info(f"DITAMAP written to {output_file}")
 
+def writeline(filename: str, line: str):
+    with open(filename,"a") as f:
+        f.write(line.rstrip()+"\n")
 
-def process_level(parent: ET.Element, entries: List[CSVEntry], index: int) -> int:
+
+def process_level(parent: ET.Element, entries: List[CSVEntry], index: int, 
+                  asciidoc_name: str, asciidoc_level: int) -> int:
     """Process the entry at the index and any entries of the same or subordinate levels, adding to the parent element
     returns the next index - either the level there is higher or it is past the end"""
     current_entry = entries[index]
     current_index = index
     min_level = current_entry.level
     parent_for_children = None
+    asciidoc_name_for_children = asciidoc_name
+    asciidoc_level_for_children = asciidoc_level + 1
+    
     while current_entry.level >= min_level:
+        # print(current_entry)
         if current_entry.level == min_level:
-            parent_for_children = add_topicref(parent, title_to_filename(current_entry.text))
+            if current_entry.is_job:
+                # DO THE DITAMAP LOGIC HERE - temporarily skipped so all go to one ditamap
+                asciidoc_name_for_children = "map_"+title_to_basename(current_entry.navtitle)+".adoc"
+                writeline(asciidoc_name,f"include::{asciidoc_name_for_children}[leveloffset=+{asciidoc_level}]")
+                writeline(asciidoc_name_for_children, f"= {current_entry.navtitle}")
+                asciidoc_level_for_children = 1
+            else:
+                # as this is on the current level, UNDO the changes for writing children to submap
+                asciidoc_name_for_children = asciidoc_name
+                asciidoc_level_for_children = asciidoc_level + 1
+                writeline(asciidoc_name,f"include::{current_entry.filename}.adoc[leveloffset=+{asciidoc_level}]")
+
+            # temporarily do all ditamap here regardless of job
+            if current_entry.filename:
+                ditamap_filename = current_entry.filename+".dita"
+            else:
+                ditamap_filename = title_to_basename(current_entry.navtitle)+".dita"
+            parent_for_children = add_topicref(parent, ditamap_filename)
             current_index += 1
         else:
-            current_index = process_level(parent_for_children, entries, current_index)
+            current_index = process_level(parent_for_children, entries, current_index,
+                                          asciidoc_name_for_children, asciidoc_level_for_children)
         if current_index >= len(entries):
             break # the current index is past the end
         current_entry = entries[current_index]
@@ -214,26 +311,23 @@ def process_level(parent: ET.Element, entries: List[CSVEntry], index: int) -> in
 
 def main():
     """Main function to demonstrate CSV parsing and DITAMAP creation."""
-    import sys
-    import os
 
-    if len(sys.argv) < 3:
-        print("Usage: csv2ditamap.py <csv_file> <output_file>")
+    if len(sys.argv) < 2:
+        print("Usage: csv2ditamap.py <csv_file>")
         sys.exit(1)
 
     csv_file = sys.argv[1]
-    output_file = sys.argv[2] if len(sys.argv) > 2 else None
+    base_name,_ = os.path.splitext(csv_file)
+    output_file = base_name + ".ditamap"
+    asciimap_file = "navigation_"+base_name+".adoc"
 
     logger.info(f"Parsing {csv_file}...")
     entries = parse_csv(csv_file)
 
     logger.info(f"Parsed {len(entries)} entries")
+    #TEMP
+    #sys.exit()
 
-    # Display the first few entries as a demonstration
-    print("\nFirst 10 entries:")
-    for entry in entries[:10]:
-        indent = "  " * entry.level
-        print(f"{indent}[L{entry.level}] {entry.text}")
 
     if output_file:
         # Extract map ID from filename (without extension)
@@ -243,7 +337,7 @@ def main():
         logger.info(f"\nCreating DITAMAP with id='{map_id}'...")
         map_root = create_ditamap(map_id, map_title)
 
-        process_level(map_root, entries, 0)
+        process_level(map_root, entries, 0, asciimap_file, 1)
         
         write_ditamap(map_root, output_file)
         print(f"\nDITAMAP structure created at: {output_file}")
